@@ -16,15 +16,20 @@ import Domoticz
 import requests
 from datetime import datetime, timedelta
 from enum import Enum
+import time
+import urllib
 
 TIMEOUT = 10
 RETRIES = 3
-BASE_URL = "https://api.delta.electrolux.com/api"
-TOKEN_URL = "https://electrolux-wellbeing-client.vercel.app/api/mu52m5PR9X"
-LOGIN_URL = f"{BASE_URL}/Users/Login"
-APPLIANCES_URL = f"{BASE_URL}/Domains/Appliances"
-APPLIANCE_INFO_URL = f"{BASE_URL}/AppliancesInfo"
-APPLIANCE_DATA_URL = f"{BASE_URL}/Appliances"
+
+CLIENT_ID = "ElxOneApp"
+CLIENT_SECRET = "8UKrsKD7jH9zvTV7rz5HeCLkit67Mmj68FvRVTlYygwJYy4dW6KF2cVLPKeWzUQUd6KJMtTifFf4NkDnjI7ZLdfnwcPtTSNtYvbP7OzEkmQD9IjhMOf5e1zeAQYtt2yN"
+X_API_KEY = "2AMqwEV5MqVhTKrRCyYfVF8gmKrd2rAmp7cUsfky"
+
+BASE_URL = "https://api.ocp.electrolux.one"
+AUTHORIZATION_URL = f"{BASE_URL}/one-account-authorization/api/v1"
+AUTHENTICATION_URL = f"{BASE_URL}/one-account-authentication/api/v1"
+API_URL = f"{BASE_URL}/appliance/api/v2"
 
 HUMIDITY_NORMAL = 0
 HUMIDITY_COMFORTABLE = 1
@@ -62,25 +67,46 @@ class BasePlugin:
         return
 
     def _get_token(self) -> dict:
-        return self.api_wrapper("get", TOKEN_URL)
+        json={"clientId": CLIENT_ID,
+              "clientSecret": CLIENT_SECRET,
+              "grantType": "client_credentials"}
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+        return self.api_wrapper("post", f'{AUTHORIZATION_URL}/token', json, headers)
 
     def _login(self, access_token: str) -> dict:
         credentials = {
-            "Username": self._username,
-            "Password": self._password
+            "username": self._username,
+            "password": self._password
         }
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
-            "Accept": "application/json"
+            "Accept": "application/json",
+            "x-api-key": X_API_KEY
         }
-        return self.api_wrapper("post", LOGIN_URL, credentials, headers)
+        return self.api_wrapper("post", f'{AUTHENTICATION_URL}/authenticate', credentials, headers)
+
+    def _get_token2(self, idToken: str, countryCode: str) -> dict:
+        credentials = {
+            "clientId": CLIENT_ID,
+            "idToken": idToken,
+            "grantType": "urn:ietf:params:oauth:grant-type:token-exchange"
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Origin-Country-Code": countryCode
+        }
+        return self.api_wrapper("post", f'{AUTHORIZATION_URL}/token', credentials, headers)
 
     def get_login(self) -> bool:
         if self._current_access_token is not None and self._token_expires > datetime.now():
             return True
 
-        Domoticz.Debug("Current token is not set or expired")
+        Domoticz.Log("Current token is not set or expired")
 
         self._token = None
         self._current_access_token = None
@@ -89,14 +115,21 @@ class BasePlugin:
         if 'accessToken' not in access_token:
             self._access_token = None
             self._current_access_token = None
-            Domoticz.Debug("AccessToken 1 is missing")
+            Domoticz.Error("AccessToken 1 is missing")
             return False
 
-        token = self._login(access_token['accessToken'])
+        userToken = self._login(access_token['accessToken'])
+
+        if 'idToken' not in userToken:
+            self._current_access_token = None
+            Domoticz.Error("User login failed")
+            return False
+
+        token = self._get_token2(userToken['idToken'], userToken['countryCode'])
 
         if 'accessToken' not in token:
             self._current_access_token = None
-            Domoticz.Debug("AccessToken 2 is missing")
+            Domoticz.Error("AccessToken 2 is missing")
             return False
 
         self._token_expires = datetime.now() + timedelta(seconds=token['expiresIn'])
@@ -104,28 +137,14 @@ class BasePlugin:
 
         return True
 
-    def _get_appliance_info(self, access_token: str, pnc_id: str) -> dict:
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-        }
-        url = f"{APPLIANCE_INFO_URL}/{pnc_id}"
-        return self.api_wrapper("get", url, headers=headers)
-
-    def _get_appliance_data(self, access_token: str, pnc_id: str) -> dict:
-        headers = {
-            "Authorization": f"Bearer {access_token}"
-        }
-        return self.api_wrapper("get", f"{APPLIANCE_DATA_URL}/{pnc_id}", headers=headers)
-
     def _get_appliances(self, access_token: str) -> dict:
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
-            "Accept": "application/json"
+            "Accept": "application/json",
+            "x-api-key": X_API_KEY
         }
-        return self.api_wrapper("get", APPLIANCES_URL, headers=headers)
+        return self.api_wrapper("get", f'{API_URL}/appliances', headers=headers)
 
     def _send_command(self, access_token: str, pnc_id: str, command: dict) -> None:
         headers = {
@@ -141,22 +160,23 @@ class BasePlugin:
         while not self.get_login() and n < RETRIES:
             Domoticz.Log(f"Re-trying login. Attempt {n + 1} / {RETRIES}")
             n += 1
+            time.sleep(n)
 
         if self._current_access_token is None:
-            raise Exception("Unable to login")
+            Domoticz.Error("Unable to login")
+            return
 
         access_token = self._current_access_token
         appliances = self._get_appliances(access_token)
         Domoticz.Debug(f"Fetched data: {appliances}")
 
-        for appliance in (appliance for appliance in appliances if 'pncId' in appliance):
-            modelName = appliance['modelName']
-            pncId = appliance['pncId']
-            applianceName = appliance['applianceName']
-            appliance_info = self._get_appliance_info(access_token, pncId)
-            Domoticz.Debug(f"Fetched data: {appliance_info}")
+        for appliance in (appliance for appliance in appliances if 'applianceId' in appliance):
+            modelName = appliance['applianceData']['modelName']
+            applianceId = appliance['applianceId']
+            applianceName = appliance['applianceData']['applianceName']
+            Domoticz.Debug(f'Found appliance {applianceName}')
 
-            if appliance_info['device'] != 'AIR_PURIFIER':
+            if 'PM10' not in appliance['properties']['reported']:
                 continue
 
             maxLevel = 5
@@ -165,24 +185,21 @@ class BasePlugin:
                 maxLevel = 9
                 co2Type = "CO2"
 
-            appliance_data = self._get_appliance_data(access_token, pncId)
-            Domoticz.Debug(f"{appliance_data.get('applianceData', {}).get('applianceName', 'N/A')}: {appliance_data}")
+            data = appliance.get('properties', {}).get('reported', {})
+            data['connectionState'] = appliance.get('connectionState')
+            data['status'] = appliance.get('connectionState')
 
-            data = appliance_data.get('twin', {}).get('properties', {}).get('reported', {})
-            data['connectionState'] = appliance_data.get('twin', {}).get('connectionState')
-            data['status'] = appliance_data.get('twin', {}).get('connectionState')
-
-            updateDevice(pncId, "State", str(data['connectionState']))
-            updateDevice(pncId, "Workmode", data['Workmode'])
-            updateDevice(pncId, "Fanspeed", data['Fanspeed'], maxLevel)
-            updateDevice(pncId, "Ionizer", str(data['Ionizer']))
-            updateDevice(pncId, "PM1", str(data['PM1']))
-            updateDevice(pncId, "PM2_5", str(data['PM2_5']))
-            updateDevice(pncId, "PM10", str(data['PM10']))
-            updateDevice(pncId, "Temp", str(data['Temp']))
-            updateDevice(pncId, "Humidity", data['Humidity'], round(data['Temp']))
-            updateDevice(pncId, co2Type, str(data[co2Type]))
-            updateDevice(pncId, "TVOC", str(data['TVOC']))
+            updateDevice(applianceId, "State", str(data['connectionState']))
+            updateDevice(applianceId, "Workmode", data['Workmode'])
+            updateDevice(applianceId, "Fanspeed", data['Fanspeed'], maxLevel)
+            updateDevice(applianceId, "Ionizer", str(data['Ionizer']))
+            updateDevice(applianceId, "PM1", str(data['PM1']))
+            updateDevice(applianceId, "PM2_5", str(data['PM2_5']))
+            updateDevice(applianceId, "PM10", str(data['PM10']))
+            updateDevice(applianceId, "Temp", str(data['Temp']))
+            updateDevice(applianceId, "Humidity", data['Humidity'], round(data['Temp']))
+            updateDevice(applianceId, co2Type, str(data[co2Type]))
+            updateDevice(applianceId, "TVOC", str(data['TVOC']))
 
 
     def api_wrapper(self, method: str, url: str, data: dict = {}, headers: dict = {}) -> dict:
@@ -225,7 +242,10 @@ class BasePlugin:
         self._password = Parameters["Password"]
 
         self.get_data()
-        Domoticz.Heartbeat(int(Parameters["Mode1"]))
+        if Parameters["Mode1"]:
+            Domoticz.Heartbeat(int(Parameters["Mode1"]))
+        else:
+            Domoticz.Heartbeat(60)
 
     def onHeartbeat(self):
         self.get_data()
