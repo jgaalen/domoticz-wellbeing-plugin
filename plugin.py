@@ -150,10 +150,10 @@ class BasePlugin:
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
-            "Accept": "application/json"
+            "Accept": "application/json",
+            "x-api-key": X_API_KEY
         }
-
-        self.api_wrapper("put", f"{APPLIANCE_DATA_URL}/{pnc_id}/Commands", data=command, headers=headers)
+        self.api_wrapper("put", f"{API_URL}/appliances/{pnc_id}/command", data=command, headers=headers)
 
     def get_data(self):
         n = 0
@@ -211,7 +211,10 @@ class BasePlugin:
 
             elif method == "put":
                 response = requests.put(url, headers=headers, json=data, timeout=TIMEOUT)
-                return response.json()
+                if len(response.content) > 0:
+                    return response.json()
+                else:
+                    return True
 
             elif method == "patch":
                 requests.patch(url, headers=headers, json=data, timeout=TIMEOUT)
