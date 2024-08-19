@@ -1,40 +1,56 @@
-#!/usr/bin/env python
 """
 Electrolux AEG Wellbeing
+Author: Joerek van Gaalen
 """
 """
-<plugin key="wellbeing" name="Electrolux AEG Wellbeing" version="0.1" author="Joerek van Gaalen">
+<plugin key="wellbeing" name="Electrolux AEG Wellbeing" version="0.5" author="Joerek van Gaalen">
+    <description>
+        <h2>Electrolux AEG Wellbeing Plugin</h2><br/>
+        <h3>Features</h3>
+        <ul style="list-style-type:square">
+            <li>Control your Electrolux AEG Wellbeing devices</li>
+            <li>Monitor air quality, temperature, and humidity</li>
+        </ul>
+        <h3>Devices</h3>
+        <ul style="list-style-type:square">
+            <li>Air Purifiers</li>
+        </ul>
+        <h3>Configuration</h3>
+        <ul style="list-style-type:square">
+            <li>Enter your Electrolux AEG account credentials</li>
+            <li>Set the desired update interval (minimum recommended: 18 seconds)</li>
+        </ul>
+    </description>
     <params>
         <param field="Username" label="Username" width="200px" required="true"/>
-        <param field="Password" label="Password" width="200px" required="true"/>
-        <param field="Mode1" label="Reading Interval sec." width="40px" required="true" default="60" />
+        <param field="Password" label="Password" width="200px" required="true" password="true"/>
+        <param field="Mode1" label="Reading Interval (sec)" width="40px" required="true" default="60">
+            <description>How often to fetch data from the API (in seconds). Warning: Setting this below 18 seconds may result in rate limit errors!</description>
+        </param>
     </params>
 </plugin>
 """
 
 import Domoticz
 import requests
+import re
 from datetime import datetime, timedelta
 from enum import Enum
 import time
-import urllib
 
 TIMEOUT = 10
 RETRIES = 3
-
-CLIENT_ID = "ElxOneApp"
-CLIENT_SECRET = "8UKrsKD7jH9zvTV7rz5HeCLkit67Mmj68FvRVTlYygwJYy4dW6KF2cVLPKeWzUQUd6KJMtTifFf4NkDnjI7ZLdfnwcPtTSNtYvbP7OzEkmQD9IjhMOf5e1zeAQYtt2yN"
-X_API_KEY = "2AMqwEV5MqVhTKrRCyYfVF8gmKrd2rAmp7cUsfky"
-
-BASE_URL = "https://api.ocp.electrolux.one"
-AUTHORIZATION_URL = f"{BASE_URL}/one-account-authorization/api/v1"
-AUTHENTICATION_URL = f"{BASE_URL}/one-account-authentication/api/v1"
-API_URL = f"{BASE_URL}/appliance/api/v2"
 
 HUMIDITY_NORMAL = 0
 HUMIDITY_COMFORTABLE = 1
 HUMIDITY_DRY = 2
 HUMIDITY_WET = 3
+
+class Mode(str, Enum):
+    OFF = "PowerOff"
+    AUTO = "Auto"
+    MANUAL = "Manual"
+    UNDEFINED = "Undefined"
 
 def humidity2status_indoor(hlevel, temperature):
     if hlevel is None or temperature is None:
@@ -47,246 +63,332 @@ def humidity2status_indoor(hlevel, temperature):
         return HUMIDITY_WET
     return HUMIDITY_NORMAL
 
-class Mode(str, Enum):
-    OFF = "PowerOff"
-    AUTO = "Auto"
-    MANUAL = "Manual"
-    UNDEFINED = "Undefined"
+class ElectroluxAuth:
+    def __init__(self, username, password):
+        self.username = username
+        self.password = password
+        self.session = requests.Session()
+        self.access_token = None
+        self.refresh_token = None
+        self.api_key = None
+        self.token_expires = None
 
-class BasePlugin:
+    def authenticate(self):
+        try:
 
-    def __init__(self):
-        self._username = None
-        self._password = None
-        self._access_token = None
-        self._token = None
-        self._current_access_token = None
-        self._token_expires = datetime.now()
-        self.appliances = None
+            # Step 1: Get CSRF token
+            Domoticz.Debug("Step 1: Getting CSRF token...")
+            login_url = "https://account.electrolux.one/ui/edp/login?client_id=HeiOpenApi&redirect_uri=https://developer.electrolux.one/loggedin"
+            response = self.session.get(login_url)
+            csrf_token = re.search('<meta name="x-csrf-token" content="(.*?)"/>', response.text).group(1)
 
-        return
+            # Step 2: First authorization
+            Domoticz.Debug("Step 2: Performing first authorization...")
+            auth_url = "https://api.account.electrolux.one/api/v1/authorize"
+            auth_data = {
+                "email": self.username,
+                "password": self.password,
+                "redirectUri": "https://developer.electrolux.one/loggedin",
+                "clientId": "HeiOpenApi",
+                "state": None
+            }
+            headers = {"x-csrf-token": csrf_token}
+            response = self.session.post(auth_url, json=auth_data, headers=headers)
+            code = re.search(r'\?code=(.*?)&', response.text).group(1)
+            Domoticz.Debug(f"Authorization code obtained: {code[:10]}...")  # Log only first 10 characters for security
 
-    def _get_token(self) -> dict:
-        json={"clientId": CLIENT_ID,
-              "clientSecret": CLIENT_SECRET,
-              "grantType": "client_credentials"}
+            # Step 3: Get first token
+            Domoticz.Debug("Step 3: Getting first token...")
+            token_url = "https://api.developer.electrolux.one/api/v1/token"
+            token_data = {
+                "code": code,
+                "redirectUri": "https://developer.electrolux.one/loggedin"
+            }
+            response = self.session.post(token_url, json=token_data)
+            Domoticz.Debug("First token obtained successfully.")
+
+            # Step 4: Second authorization
+            Domoticz.Debug("Step 4: Performing second authorization...")
+            auth_data["redirectUri"] = "https://developer.electrolux.one/generateToken"
+            response = self.session.post(auth_url, json=auth_data, headers=headers)
+            code = re.search(r'\?code=(.*?)&', response.text).group(1)
+            Domoticz.Debug(f"Second authorization code obtained: {code[:10]}...")  # Log only first 10 characters for security
+
+            # Step 5: Generate final tokens
+            Domoticz.Debug("Step 5: Generating final tokens...")
+            gen_token_url = "https://api.developer.electrolux.one/api/v1/generate-token"
+            gen_token_data = {
+                "code": code,
+                "redirectUri": "https://developer.electrolux.one/generateToken"
+            }
+            response = self.session.post(gen_token_url, json=gen_token_data)
+            tokens = response.json()
+            self.access_token = tokens['accessToken']
+            self.refresh_token = tokens['refreshToken']
+
+            # Set token expiration time
+            expires_in = tokens.get('expiresIn', 3600)  # Default to 1 hour if not provided
+            self.token_expires = datetime.now() + timedelta(seconds=expires_in)
+            Domoticz.Debug(f"Token will expire at {self.token_expires}")
+
+            Domoticz.Debug("Final tokens generated successfully.")
+
+            # Step 6: Get or create API key
+            Domoticz.Debug("Step 6: Getting or creating API key...")
+            new_key_created = self.get_or_create_api_key()
+
+            if new_key_created:
+                Domoticz.Log("New API key created. Reauthenticating...")
+                return self.authenticate()
+
+            Domoticz.Log("Authentication process completed successfully.")
+            return True
+        except Exception as e:
+            Domoticz.Error(f"Authentication failed: {str(e)}")
+            return False
+
+    def get_or_create_api_key(self):
+        api_keys_url = "https://api.developer.electrolux.one/api/v1/api-keys"
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+
+        Domoticz.Debug("Fetching existing API keys...")
+        response = self.session.get(api_keys_url, headers=headers)
+        api_keys = response.json()
+
+        enabled_key = next((key for key in api_keys if key['status'] == 'ENABLED'), None)
+
+        if enabled_key:
+            self.api_key = enabled_key['apiKey']
+            Domoticz.Debug(f"Using existing API key: {self.api_key[:10]}...")  # Log only first 10 characters for security
+        else:
+            Domoticz.Log("No enabled API key found. Creating a new one...")
+            create_key_data = {"name": "domoticz"}
+            response = self.session.post(api_keys_url, json=create_key_data, headers=headers)
+            new_key = response.json()
+            self.api_key = new_key['apiKey']
+            Domoticz.Debug(f"New API key created: {self.api_key[:10]}...")  # Log only first 10 characters for security
+
+    def refresh_access_token(self):
+        Domoticz.Debug("Refreshing access token...")
+        refresh_url = "https://api.developer.electrolux.one/api/v1/token/refresh"
+        refresh_data = {
+            "refreshToken": self.refresh_token
+        }
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json"
         }
-        return self.api_wrapper("post", f'{AUTHORIZATION_URL}/token', json, headers)
-
-    def _login(self, access_token: str) -> dict:
-        credentials = {
-            "username": self._username,
-            "password": self._password
-        }
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "x-api-key": X_API_KEY
-        }
-        return self.api_wrapper("post", f'{AUTHENTICATION_URL}/authenticate', credentials, headers)
-
-    def _get_token2(self, idToken: str, countryCode: str) -> dict:
-        credentials = {
-            "clientId": CLIENT_ID,
-            "idToken": idToken,
-            "grantType": "urn:ietf:params:oauth:grant-type:token-exchange"
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Origin-Country-Code": countryCode
-        }
-        return self.api_wrapper("post", f'{AUTHORIZATION_URL}/token', credentials, headers)
-
-    def get_login(self) -> bool:
-        if self._current_access_token is not None and self._token_expires > datetime.now():
-            return True
-
-        Domoticz.Log("Current token is not set or expired")
-
-        self._token = None
-        self._current_access_token = None
-        access_token = self._get_token()
-
-        if 'accessToken' not in access_token:
-            self._access_token = None
-            self._current_access_token = None
-            Domoticz.Error("AccessToken 1 is missing")
-            return False
-
-        userToken = self._login(access_token['accessToken'])
-
-        if 'idToken' not in userToken:
-            self._current_access_token = None
-            Domoticz.Error("User login failed")
-            return False
-
-        token = self._get_token2(userToken['idToken'], userToken['countryCode'])
-
-        if 'accessToken' not in token:
-            self._current_access_token = None
-            Domoticz.Error("AccessToken 2 is missing")
-            return False
-
-        self._token_expires = datetime.now() + timedelta(seconds=token['expiresIn'])
-        self._current_access_token = token['accessToken']
-
-        return True
-
-    def _get_appliances(self, access_token: str) -> dict:
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "x-api-key": X_API_KEY
-        }
-        return self.api_wrapper("get", f'{API_URL}/appliances', headers=headers)
-
-    def _send_command(self, access_token: str, pnc_id: str, command: dict) -> None:
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "x-api-key": X_API_KEY
-        }
-        self.api_wrapper("put", f"{API_URL}/appliances/{pnc_id}/command", data=command, headers=headers)
-
-    def get_data(self):
-        n = 0
-        while not self.get_login() and n < RETRIES:
-            Domoticz.Log(f"Re-trying login. Attempt {n + 1} / {RETRIES}")
-            n += 1
-            time.sleep(n)
-
-        if self._current_access_token is None:
-            Domoticz.Error("Unable to login")
-            return
-
-        access_token = self._current_access_token
-        appliances = self._get_appliances(access_token)
-        Domoticz.Debug(f"Fetched data: {appliances}")
-
-        for appliance in (appliance for appliance in appliances if 'applianceId' in appliance):
-            modelName = appliance['applianceData']['modelName']
-            applianceId = appliance['applianceId']
-            applianceName = appliance['applianceData']['applianceName']
-            Domoticz.Debug(f'Found appliance {applianceName}')
-
-            if 'PM10' not in appliance['properties']['reported']:
-                continue
-
-            maxLevel = 5
-            co2Type = "ECO2"
-            if modelName == "PUREA9":
-                maxLevel = 9
-                co2Type = "CO2"
-
-            data = appliance.get('properties', {}).get('reported', {})
-            data['connectionState'] = appliance.get('connectionState')
-            data['status'] = appliance.get('connectionState')
-
-            updateDevice(applianceId, "State", str(data['connectionState']))
-            updateDevice(applianceId, "Workmode", data['Workmode'])
-            updateDevice(applianceId, "Fanspeed", data['Fanspeed'], maxLevel)
-            updateDevice(applianceId, "Ionizer", str(data['Ionizer']))
-            updateDevice(applianceId, "PM1", str(data['PM1']))
-            updateDevice(applianceId, "PM2_5", str(data['PM2_5']))
-            updateDevice(applianceId, "PM10", str(data['PM10']))
-            updateDevice(applianceId, "Temp", str(data['Temp']))
-            updateDevice(applianceId, "Humidity", data['Humidity'], round(data['Temp']))
-            updateDevice(applianceId, co2Type, str(data[co2Type]))
-            updateDevice(applianceId, "TVOC", str(data['TVOC']))
-
-
-    def api_wrapper(self, method: str, url: str, data: dict = {}, headers: dict = {}) -> dict:
-        """Get information from the API."""
         try:
-            if method == "get":
-                response = requests.get(url, headers=headers, timeout=TIMEOUT)
-                return response.json()
+            response = requests.post(refresh_url, json=refresh_data, headers=headers)
+            tokens = response.json()
+            self.access_token = tokens['accessToken']
+            self.refresh_token = tokens['refreshToken']
 
-            elif method == "put":
-                response = requests.put(url, headers=headers, json=data, timeout=TIMEOUT)
-                if len(response.content) > 0:
-                    return response.json()
-                else:
-                    return True
+            # Update token expiration time
+            expires_in = tokens.get('expiresIn', 3600)  # Default to 1 hour if not provided
+            self.token_expires = datetime.now() + timedelta(seconds=expires_in)
+            Domoticz.Debug(f"Token refreshed. New expiration time: {self.token_expires}")
 
-            elif method == "patch":
-                requests.patch(url, headers=headers, json=data, timeout=TIMEOUT)
+            return True
+        except Exception as e:
+            Domoticz.Error(f"Failed to refresh token: {str(e)}")
+            return False
 
-            elif method == "post":
-                response = requests.post(url, headers=headers, json=data, timeout=TIMEOUT)
-                return response.json()
-
-        except requests.exceptions.Timeout as exception:
-            Domoticz.Error(
-                "Timeout error fetching information from %s - %s",
-                url,
-                exception,
-            )
-
-        except requests.exceptions.RequestException as exception:
-            Domoticz.Error(
-                "Error fetching information from %s - %s",
-                url,
-                exception,
-            )
-        except Exception as exception:  # pylint: disable=broad-except
-            Domoticz.Error("Something really wrong happened! - %s", exception)
+class BasePlugin:
+    def __init__(self):
+        self._username = None
+        self._password = None
+        self.auth = None
+        self.token_expires = datetime.now()
+        self.appliances = {}  # Store appliance IDs and their capabilities
 
     def onStart(self):
-        Domoticz.Log("Wellbeing plugin start")
+        Domoticz.Log("Wellbeing plugin starting...")
         self._username = Parameters["Username"]
         self._password = Parameters["Password"]
 
-        self.get_data()
-        if Parameters["Mode1"]:
-            Domoticz.Heartbeat(int(Parameters["Mode1"]))
+        Domoticz.Log("Initializing ElectroluxAuth...")
+        self.auth = ElectroluxAuth(self._username, self._password)
+        if self.auth.authenticate():
+            Domoticz.Debug("Authentication successful. Fetching appliance information...")
+            self.fetch_appliances()
+            self.fetch_appliance_capabilities()
+            self.get_data()
         else:
+            Domoticz.Error("Authentication failed. Please check your credentials and try again.")
+
+        if Parameters["Mode1"]:
+            interval = int(Parameters["Mode1"])
+            Domoticz.Log(f"Setting heartbeat interval to {interval} seconds.")
+            Domoticz.Heartbeat(interval)
+        else:
+            Domoticz.Log("No heartbeat interval specified. Using default of 60 seconds.")
             Domoticz.Heartbeat(60)
 
+    def fetch_appliances(self):
+        Domoticz.Debug("Fetching appliances...")
+        headers = self._get_headers()
+        url = "https://api.developer.electrolux.one/api/v1/appliances"
+        response = self.api_wrapper("get", url, headers=headers)
+
+        for appliance in response:
+            if 'applianceId' in appliance:
+                self.appliances[appliance['applianceId']] = {'capabilities': None}
+                Domoticz.Debug(f"Found appliance: {appliance['applianceId']}")
+
+    def fetch_appliance_capabilities(self):
+        for applianceId in self.appliances:
+            Domoticz.Debug(f"Fetching capabilities for appliance {applianceId}...")
+            headers = self._get_headers()
+            url = f"https://api.developer.electrolux.one/api/v1/appliances/{applianceId}/info"
+            response = self.api_wrapper("get", url, headers=headers)
+
+            if response:
+                self.appliances[applianceId]['capabilities'] = response.get('capabilities', {})
+                self.appliances[applianceId]['info'] = response.get('applianceInfo', {})
+                Domoticz.Debug(f"Capabilities fetched for appliance {applianceId}")
+            else:
+                Domoticz.Error(f"Failed to fetch capabilities for appliance {applianceId}")
+
     def onHeartbeat(self):
+        if datetime.now() >= self.auth.token_expires:
+            Domoticz.Debug("Access token expired. Initiating refresh...")
+            if self.auth.refresh_access_token():
+                Domoticz.Debug("Access token refreshed successfully. Updating data...")
+            else:
+                Domoticz.Error("Failed to refresh access token. Skipping data update.")
+                return
+
         self.get_data()
 
+    def get_data(self):
+        if self.auth.access_token is None:
+            Domoticz.Error("No valid access token. Unable to fetch data.")
+            return
+
+        for applianceId in self.appliances:
+            self.update_appliance_state(applianceId)
+
+    def update_appliance_state(self, applianceId):
+        Domoticz.Debug(f"Updating state for appliance {applianceId}...")
+        headers = self._get_headers()
+        url = f"https://api.developer.electrolux.one/api/v1/appliances/{applianceId}/state"
+        response = self.api_wrapper("get", url, headers=headers)
+
+        if not response or 'properties' not in response or 'reported' not in response['properties']:
+            Domoticz.Error(f"Invalid data structure for appliance {applianceId}")
+            return
+
+        reported_data = response['properties']['reported']
+        capabilities = self.appliances[applianceId]['capabilities']
+        appliance_info = self.appliances[applianceId]['info']
+
+        # Determine max fan speed level and CO2 type
+        max_fanspeed = capabilities.get('Fanspeed', {}).get('max', 5)
+        co2_type = "CO2" if appliance_info.get('model') == 'AX9' else "ECO2"
+
+        # Update devices
+        updateDevice(applianceId, "State", str(response.get('connectionState', 'Unknown')))
+        updateDevice(applianceId, "Workmode", reported_data.get('Workmode', 'Unknown'))
+        updateDevice(applianceId, "Fanspeed", reported_data.get('Fanspeed', 0), max_fanspeed)
+        updateDevice(applianceId, "Ionizer", str(reported_data.get('Ionizer', False)))
+        updateDevice(applianceId, "PM1", str(reported_data.get('PM1', 0)))
+        updateDevice(applianceId, "PM2_5", str(reported_data.get('PM2_5', 0)))
+        updateDevice(applianceId, "PM10", str(reported_data.get('PM10', 0)))
+        updateDevice(applianceId, "Temp", str(reported_data.get('Temp', 0)))
+        updateDevice(applianceId, "Humidity", reported_data.get('Humidity', 0), round(reported_data.get('Temp', 0)))
+        updateDevice(applianceId, co2_type, str(reported_data.get(co2_type, 0)))
+        updateDevice(applianceId, "TVOC", str(reported_data.get('TVOC', 0)))
+
+    def _get_headers(self):
+        return {
+            "Authorization": f"Bearer {self.auth.access_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "x-api-key": self.auth.api_key
+        }
+
+    def api_wrapper(self, method: str, url: str, data: dict = {}, headers: dict = {}) -> dict:
+        Domoticz.Debug(f"API request: {method.upper()} {url}")
+        try:
+            if method == "get":
+                response = requests.get(url, headers=headers, timeout=TIMEOUT)
+            elif method == "put":
+                response = requests.put(url, headers=headers, json=data, timeout=TIMEOUT)
+            elif method == "post":
+                response = requests.post(url, headers=headers, json=data, timeout=TIMEOUT)
+
+            response.raise_for_status()
+            Domoticz.Debug(f"API request successful. Status code: {response.status_code}")
+            return response.json() if response.content else {}
+        except requests.exceptions.Timeout:
+            Domoticz.Error(f"Timeout error fetching information from {url}")
+        except requests.exceptions.RequestException as e:
+            Domoticz.Error(f"Error fetching information from {url}: {str(e)}")
+        except Exception as e:
+            Domoticz.Error(f"Unexpected error during API request: {str(e)}")
+        return {}
+
     def onCommand(self, Unit, Command, Level, Color):
-
-        access_token = self._current_access_token
-
+        Domoticz.Debug(f"Command received for Unit {Unit}: {Command} (Level: {Level}, Color: {Color})")
         if Devices[Unit].Options.get('type'):
+            applianceId = Devices[Unit].DeviceID.split('_')[0]
             if Devices[Unit].Options['type'] == 'Ionizer':
-                if Command == "Off":
-                    cmd = {"Ionizer": False}
-                else:
-                    cmd = {"Ionizer": True}
-                self._send_command(access_token, Devices[Unit].Options['pncId'], cmd)
-                self.get_data()
-
-            if Devices[Unit].Options['type'] == 'Workmode':
+                cmd = {"Ionizer": Command == "On"}
+                self._send_command(applianceId, cmd)
+            elif Devices[Unit].Options['type'] == 'Workmode':
                 if Command == "Set Level":
-                    if Level == 10:
-                        cmd = {"WorkMode": "Auto"}
-                    elif Level == 20:
-                        cmd = {"WorkMode": "Manual"}
+                    cmd = {"Workmode": "Auto" if Level == 10 else "Manual" if Level == 20 else "PowerOff"}
                 else:
-                    cmd = {"WorkMode": "PowerOff"}
-                self._send_command(access_token, Devices[Unit].Options['pncId'], cmd)
-                self.get_data()
-
-            if Devices[Unit].Options['type'] == 'Fanspeed':
-                workmodeId = Devices[Unit].Options['pncId'] + "_Workmode"
-                workmodeUnit = GetDomoDeviceInfo(workmodeId)
-                if str(Devices[workmodeUnit].sValue) == '20': # Check if workmode = manual
+                    cmd = {"Workmode": "PowerOff"}
+                self._send_command(applianceId, cmd)
+            elif Devices[Unit].Options['type'] == 'Fanspeed':
+                workmode = self.get_workmode(applianceId)
+                if workmode == 'Manual':
                     fanspeed = round(Level / 10)
                     cmd = {"Fanspeed": fanspeed}
-                    self._send_command(access_token, Devices[Unit].Options['pncId'], cmd)
-                    self.get_data()
+                    self._send_command(applianceId, cmd)
                 else:
-                    Domoticz.Log("Cannot update fanspeed because workmode is not set to manual")
+                    Domoticz.Log(f"Cannot update fanspeed because workmode is not set to manual: {workmode}")
+
+            # Update the appliance state after sending a command
+            self.update_appliance_state(applianceId)
+
+    def _send_command(self, applianceId: str, command: dict) -> bool:
+        Domoticz.Debug(f"Sending command to appliance {applianceId}: {command}")
+        headers = self._get_headers()
+        url = f"https://api.developer.electrolux.one/api/v1/appliances/{applianceId}/command"
+
+        try:
+            response = requests.put(url, json=command, headers=headers, timeout=TIMEOUT)
+
+            if 200 <= response.status_code < 300:
+                Domoticz.Debug(f"Command sent successfully to appliance {applianceId}. Status code: {response.status_code}")
+                return True
+            else:
+                Domoticz.Error(f"Failed to send command to appliance {applianceId}. Status code: {response.status_code}")
+                return False
+
+        except requests.exceptions.RequestException as e:
+            Domoticz.Error(f"Error sending command to appliance {applianceId}: {str(e)}")
+            return False
+
+    def get_workmode(self, applianceId):
+        for unit in Devices:
+            if Devices[unit].DeviceID == f"{applianceId}_Workmode":
+                # Map the numeric level to the corresponding workmode name
+                level = int(Devices[unit].sValue)
+                if level == 0:
+                    return "PowerOff"
+                elif level == 10:
+                    return "Auto"
+                elif level == 20:
+                    return "Manual"
+                else:
+                    Domoticz.Error(f"Unknown workmode level: {level}")
+                    return "Unknown"
+        Domoticz.Error(f"Workmode device not found for appliance {applianceId}")
+        return None
 
 global _plugin
 _plugin = BasePlugin()
